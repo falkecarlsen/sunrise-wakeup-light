@@ -1,0 +1,182 @@
+esphome:
+  name: bed-sunrise
+
+esp8266:
+  board: d1_mini
+
+# Enable logging
+logger:
+
+# Enable Home Assistant API
+api:
+  password: ""
+
+ota:
+  - platform: esphome
+    password: ""
+
+wifi:
+  ssid: !secret wifi_ssid 
+  password: !secret wifi_passphrase 
+
+  # Enable fallback hotspot (captive portal) in case wifi connection fails
+  ap:
+    ssid: "bed-sunrise"
+    password: !secret ap_captive_passphrase
+
+captive_portal:
+    
+# ---- Parameters & state ----
+globals:
+  - id: sunrise_duration         # total fade time (seconds)
+    type: int
+    restore_value: no
+    initial_value: '120'         # 15 minutes
+
+  - id: sunrise_steps            # how many increments to render
+    type: int
+    restore_value: no
+    initial_value: '120'         # 120 steps => smooth & light on CPU
+
+  - id: sunrise_active           # guard to avoid PIR interference
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+  - id: sunrise_step             # loop counter used by the script
+    type: int
+    restore_value: no
+    initial_value: '0'
+
+# ---- LED strip (WS2812 on D4 / GPIO2), BRG order, start OFF ----
+light:
+  - platform: neopixelbus
+    id: bed_strip
+    name: "Bed Strip"
+    variant: WS2812
+    type: BRG                   # matches your WLED BRG order
+    pin: GPIO2                  # D4
+    num_leds: 27
+    method: ESP8266_UART1       # very stable on D4 for ESP8266
+    restore_mode: ALWAYS_OFF
+    default_transition_length: 0s
+    gamma_correct: 1.8
+
+# ---- PIR (example D5 / GPIO14) → gentle nightlight unless sunrise is running ----
+binary_sensor:
+  - platform: gpio
+    id: pir_sensor
+    name: "Bed PIR"
+    device_class: motion
+    pin: GPIO15                 # D8 (change if you wired differently)
+    on_press:
+      - if:
+          condition:
+            lambda: 'return !id(sunrise_active);'
+          then:
+            - light.turn_on:
+                id: bed_strip
+                brightness: 0.40
+                red: 1.0
+                green: 0.2
+                blue: 0.2
+    on_release:
+      - delay: 60s
+      - if:
+          condition:
+            lambda: 'return !id(sunrise_active);'
+          then:
+            - light.turn_off: bed_strip
+
+  # ---- Test button on D8 (GPIO15) to start sunrise ----
+  # IMPORTANT: GPIO15 must be LOW at boot on ESP8266.
+  # Use mode INPUT (no pull-up), keep the board's built-in pulldown,
+  # and wire the button from D8 to 3V3 so a press reads HIGH.
+  - platform: gpio
+    id: sunrise_button
+    name: "Sunrise Test Button (D8)"
+    pin:
+      number: GPIO14            # D5
+      mode: INPUT               # no internal pullup to avoid boot issues
+    filters:
+      - delayed_on: 10ms
+      - delayed_off: 10ms
+    on_press:
+      - script.execute: sunrise_script
+
+# ---- Non-blocking sunrise fade (lerp RGB + brightness over N steps) ----
+script:
+  - id: sunrise_script
+    mode: restart
+    then:
+      # mark active & reset counter
+      - lambda: |-
+          id(sunrise_active) = true;
+          id(sunrise_step) = 0;
+
+      # initial tiny glow immediately
+      - light.turn_on:
+          id: bed_strip
+          brightness: 0.01
+          red: 1.0
+          green: 0.20
+          blue: 0.05
+          transition_length: 0s
+
+      # fade loop: non-blocking (yields each delay)
+      - while:
+          condition:
+            lambda: 'return id(sunrise_step) <= id(sunrise_steps);'
+          then:
+            - lambda: |-
+                // start/end colors + brightness
+                const float sr = 1.0, sg = 0.20, sb = 0.10;   // dim warm start
+                const float er = 1.0, eg = 0.70, eb = 0.60;   // warm white end
+                const float sbri = 0.20, ebri = 1.0;
+
+                float t = float(id(sunrise_step)) / float(id(sunrise_steps));  // 0..1
+                int transition_length = id(sunrise_duration) * 1000 / id(sunrise_steps);
+
+                auto call = id(bed_strip).turn_on();
+                call.set_transition_length(0);    // opt. use delay length for transition time
+                call.set_brightness(sbri + t * (ebri - sbri));
+                call.set_rgb(
+                  sr + t * (er - sr),
+                  sg + t * (eg - sg),
+                  sb + t * (eb - sb)
+                );
+                call.perform();
+            - delay: !lambda "return (id(sunrise_duration) * 1000) / id(sunrise_steps);"
+            - lambda: 'id(sunrise_step) += 1;'
+
+      # done
+      - lambda: 'id(sunrise_active) = false;'
+
+# ---- SNTP schedule: compute start so we END exactly at 08:00 local time ----
+time:
+  - platform: sntp
+    id: sntp_time
+    timezone: Europe/Copenhagen
+    servers:
+      - 0.pool.ntp.org
+      - 1.pool.ntp.org
+    on_time:
+      - seconds: 0
+        minutes: /1
+        then:
+          - lambda: |-
+              auto now = id(sntp_time).now();
+              if (!now.is_valid()) return;
+
+              const int end_hour = 7;
+              const int end_min  = 0;
+              int duration_min = id(sunrise_duration) / 60;
+
+              int start_hour = end_hour;
+              int start_min  = end_min - duration_min;
+              while (start_min < 0) { start_min += 60; start_hour -= 1; }
+
+              if (now.hour == start_hour && now.minute == start_min) {
+                id(sunrise_script).execute();
+              }
+
